@@ -126,14 +126,18 @@ pub trait Loader<K: Send + Sync + Hash + Eq + Clone + 'static>: Send + Sync + 's
     async fn load(&self, keys: &[K]) -> Result<HashMap<K, Self::Value>, Self::Error>;
 }
 
-struct DataLoaderInner<T> {
-    requests: Mutex<FnvHashMap<TypeId, Box<dyn Any + Sync + Send>>>,
+struct DataLoaderInner<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
+    requests: Mutex<FnvHashMap<TypeId, Requests<K, T>>>,
     loader: T,
 }
 
-impl<T> DataLoaderInner<T> {
+impl<K, T> DataLoaderInner<K, T>
+where
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    T: Loader<K>
+{
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    async fn do_load<K>(&self, disable_cache: bool, (keys, senders): KeysAndSender<K, T>)
+    async fn do_load(&self, disable_cache: bool, (keys, senders): KeysAndSender<K, T>)
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
@@ -147,8 +151,6 @@ impl<T> DataLoaderInner<T> {
                 let mut request = self.requests.lock().unwrap();
                 let typed_requests = request
                     .get_mut(&tid)
-                    .unwrap()
-                    .downcast_mut::<Requests<K, T>>()
                     .unwrap();
                 let disable_cache = typed_requests.disable_cache || disable_cache;
                 if !disable_cache {
@@ -181,8 +183,8 @@ impl<T> DataLoaderInner<T> {
 /// Data loader.
 ///
 /// Reference: <https://github.com/facebook/dataloader>
-pub struct DataLoader<T, C = NoCache> {
-    inner: Arc<DataLoaderInner<T>>,
+pub struct DataLoader<K: Send + Sync + Eq + Clone + Hash + 'static, T: Loader<K>, C = NoCache> {
+    inner: Arc<DataLoaderInner<K, T>>,
     cache_factory: C,
     delay: Duration,
     max_batch_size: usize,
@@ -190,7 +192,11 @@ pub struct DataLoader<T, C = NoCache> {
     spawner: Box<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>,
 }
 
-impl<T> DataLoader<T, NoCache> {
+impl<K, T> DataLoader<K, T, NoCache>
+where
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    T: Loader<K>
+{
     /// Use `Loader` to create a [DataLoader] that does not cache records.
     pub fn new<S, R>(loader: T, spawner: S) -> Self
     where
@@ -212,7 +218,11 @@ impl<T> DataLoader<T, NoCache> {
     }
 }
 
-impl<T, C: CacheFactory> DataLoader<T, C> {
+impl<K, T, C: CacheFactory> DataLoader<K, T, C>
+where
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    T: Loader<K>
+{
     /// Use `Loader` to create a [DataLoader] with a cache factory.
     pub fn with_cache<S, R>(loader: T, spawner: S, cache_factory: C) -> Self
     where
@@ -264,7 +274,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     }
 
     /// Enable/Disable cache of specified loader.
-    pub fn enable_cache<K>(&self, enable: bool)
+    pub fn enable_cache(&self, enable: bool)
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
@@ -273,15 +283,13 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         let mut requests = self.inner.requests.lock().unwrap();
         let typed_requests = requests
             .get_mut(&tid)
-            .unwrap()
-            .downcast_mut::<Requests<K, T>>()
             .unwrap();
         typed_requests.disable_cache = !enable;
     }
 
     /// Use this `DataLoader` load a data.
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_one<K>(&self, key: K) -> Result<Option<T::Value>, T::Error>
+    pub async fn load_one(&self, key: K) -> Result<Option<T::Value>, T::Error>
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
@@ -292,7 +300,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
 
     /// Use this `DataLoader` to load some data.
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_many<K, I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
+    pub async fn load_many<I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         I: IntoIterator<Item = K>,
@@ -310,9 +318,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
             let mut requests = self.inner.requests.lock().unwrap();
             let typed_requests = requests
                 .entry(tid)
-                .or_insert_with(|| Box::new(Requests::<K, T>::new(&self.cache_factory)))
-                .downcast_mut::<Requests<K, T>>()
-                .unwrap();
+                .or_insert_with(|| Requests::<K, T>::new(&self.cache_factory));
             let prev_count = typed_requests.keys.len();
             let mut keys_set = HashSet::new();
             let mut use_cache_values = HashMap::new();
@@ -384,8 +390,6 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
                         let mut request = inner.requests.lock().unwrap();
                         let typed_requests = request
                             .get_mut(&tid)
-                            .unwrap()
-                            .downcast_mut::<Requests<K, T>>()
                             .unwrap();
                         typed_requests.take()
                     };
@@ -409,7 +413,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn feed_many<K, I>(&self, values: I)
+    pub async fn feed_many<I>(&self, values: I)
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         I: IntoIterator<Item = (K, T::Value)>,
@@ -419,9 +423,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         let mut requests = self.inner.requests.lock().unwrap();
         let typed_requests = requests
             .entry(tid)
-            .or_insert_with(|| Box::new(Requests::<K, T>::new(&self.cache_factory)))
-            .downcast_mut::<Requests<K, T>>()
-            .unwrap();
+            .or_insert_with(|| Requests::<K, T>::new(&self.cache_factory));
         for (key, value) in values {
             typed_requests
                 .cache_storage
@@ -434,7 +436,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn feed_one<K>(&self, key: K, value: T::Value)
+    pub async fn feed_one(&self, key: K, value: T::Value)
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
@@ -447,7 +449,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn clear<K>(&self)
+    pub fn clear(&self)
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
@@ -456,14 +458,12 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         let mut requests = self.inner.requests.lock().unwrap();
         let typed_requests = requests
             .entry(tid)
-            .or_insert_with(|| Box::new(Requests::<K, T>::new(&self.cache_factory)))
-            .downcast_mut::<Requests<K, T>>()
-            .unwrap();
+            .or_insert_with(|| Requests::<K, T>::new(&self.cache_factory));
         typed_requests.cache_storage.clear();
     }
 
     /// Gets all values in the cache.
-    pub fn get_cached_values<K>(&self) -> HashMap<K, T::Value>
+    pub fn get_cached_values(&self) -> HashMap<K, T::Value>
     where
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
@@ -473,8 +473,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         match requests.get(&tid) {
             None => HashMap::new(),
             Some(requests) => {
-                let typed_requests = requests.downcast_ref::<Requests<K, T>>().unwrap();
-                typed_requests
+                requests
                     .cache_storage
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
